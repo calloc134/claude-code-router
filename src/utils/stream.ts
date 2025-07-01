@@ -24,6 +24,36 @@ export async function streamOpenAIResponse(
   // const contentBlockId = `content-block-${Date.now()}`;
   // let hasTextBlockStarted = false;
 
+  // const messageId = `msg_${Date.now()}`;
+  if (!body.stream && typeof stream[Symbol.asyncIterator] !== "function") {
+    const completion = stream as any;
+    let content: any[] = [];
+    if (completion.choices?.[0]?.message?.content) {
+      content = [{ text: completion.choices[0].message.content, type: "text" }];
+    } else if (completion.choices?.[0]?.message?.tool_calls) {
+      content = completion.choices[0].message.tool_calls.map((tc: any) => ({
+        type: "tool_use",
+        id: tc.id,
+        name: tc.function?.name,
+        input: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {},
+      }));
+    }
+    // 従来フォーマットで即時返却
+    res.json({
+      id: `msg_${Date.now()}`,
+      type: "message",
+      role: "assistant",
+      content,
+      stop_reason:
+        completion.choices[0].finish_reason === "tool_calls"
+          ? "tool_use"
+          : "end_turn",
+      stop_sequence: null,
+    });
+    res.end();
+    return;
+  }
+
   const messageId = `msg_${Date.now()}`;
   const contentBlockId = `content-block-${Date.now()}`;
   let hasTextBlockStarted = false;

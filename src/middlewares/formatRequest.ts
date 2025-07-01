@@ -130,17 +130,20 @@ export const formatRequest = async (
       : [{ role: "system", content: String(system) }];
 
     const responseTools = [
-      // ...tools
-      //   .filter((t) => !["StickerRequest"].includes(t.name))
-      //   .map((t) => ({
-      //     type: "function",
-      //     function: {
-      //       name: t.name,
-      //       description: t.description,
-      //       parameters: t.input_schema,
-      //     },
-      //   })),
-      // 例外なく入れる web_search_preview
+      // ① 元の function-tool を維持
+      ...(tools
+        ? tools
+            .filter((t) => !["StickerRequest"].includes(t.name))
+            .map((item: any) => ({
+              type: "function",
+              function: {
+                name: item.name,
+                description: item.description,
+                parameters: item.input_schema,
+              },
+            }))
+        : []),
+      ,
       { type: "web_search_preview" },
     ];
 
