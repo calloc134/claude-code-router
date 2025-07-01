@@ -10,7 +10,6 @@ export const formatRequest = async (
 ) => {
   let {
     model,
-    max_tokens,
     messages,
     system = [],
     // temperature,
@@ -126,8 +125,8 @@ export const formatRequest = async (
     //   : String(system);
 
     const instructions = Array.isArray(system)
-      ? system.map((s) => ({ role: "system", content: s.text }))
-      : [{ role: "system", content: String(system) }];
+      ? system.map((s) => s.text).join("\n\n")
+      : String(system);
 
     const responseTools = [
       // ① 元の function-tool を維持
@@ -136,14 +135,11 @@ export const formatRequest = async (
             .filter((t) => !["StickerRequest"].includes(t.name))
             .map((item: any) => ({
               type: "function",
-              function: {
-                name: item.name,
-                description: item.description,
-                parameters: item.input_schema,
-              },
+              name: item.name,
+              description: item.description,
+              parameters: item.input_schema,
             }))
         : []),
-      ,
       { type: "web_search_preview" },
     ];
 
@@ -153,10 +149,9 @@ export const formatRequest = async (
       instructions,
       input: openAIMessages,
       tools: responseTools,
-      stream: stream || false,
+      stream: stream,
       // temperature: temperature,
       metadata,
-      max_tokens,
     };
 
     req.body = newRequestBody;

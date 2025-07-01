@@ -23,7 +23,7 @@
     "express": "^4.21.2",
     "https-proxy-agent": "^7.0.6",
     "lru-cache": "^11.1.0",
-    "openai": "^4.85.4",
+    "openai": "^5.8.2",
     "tiktoken": "^1.0.21",
     "uuid": "^11.1.0"
   },
