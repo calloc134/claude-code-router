@@ -39,7 +39,10 @@ export const formatRequest = async (
             const toolCalls: any[] = [];
             anthropicMessage.content.forEach((contentPart) => {
               if (contentPart.type === "text") {
-                textContent += (typeof contentPart.text === "string" ? contentPart.text : JSON.stringify(contentPart.text)) + "\n";
+                textContent +=
+                  (typeof contentPart.text === "string"
+                    ? contentPart.text
+                    : JSON.stringify(contentPart.text)) + "\n";
               } else if (contentPart.type === "tool_use") {
                 toolCalls.push({
                   id: contentPart.id,
@@ -52,9 +55,14 @@ export const formatRequest = async (
               }
             });
             const trimmedTextContent = textContent.trim();
-            if (trimmedTextContent.length > 0) assistantMessage.content = trimmedTextContent;
+            if (trimmedTextContent.length > 0)
+              assistantMessage.content = trimmedTextContent;
             if (toolCalls.length > 0) assistantMessage.tool_calls = toolCalls;
-            if (assistantMessage.content || (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0)) {
+            if (
+              assistantMessage.content ||
+              (assistantMessage.tool_calls &&
+                assistantMessage.tool_calls.length > 0)
+            ) {
               openAiMessagesFromThisAnthropicMessage.push(assistantMessage);
             }
           } else if (anthropicMessage.role === "user") {
@@ -62,39 +70,58 @@ export const formatRequest = async (
             const subsequentToolMessages: any[] = [];
             anthropicMessage.content.forEach((contentPart) => {
               if (contentPart.type === "text") {
-                userTextMessageContent += (typeof contentPart.text === "string" ? contentPart.text : JSON.stringify(contentPart.text)) + "\n";
+                userTextMessageContent +=
+                  (typeof contentPart.text === "string"
+                    ? contentPart.text
+                    : JSON.stringify(contentPart.text)) + "\n";
               } else if (contentPart.type === "tool_result") {
                 subsequentToolMessages.push({
                   role: "tool",
                   tool_call_id: contentPart.tool_use_id,
-                  content: typeof contentPart.content === "string" ? contentPart.content : JSON.stringify(contentPart.content),
+                  content:
+                    typeof contentPart.content === "string"
+                      ? contentPart.content
+                      : JSON.stringify(contentPart.content),
                 });
               }
             });
             const trimmedUserText = userTextMessageContent.trim();
             if (trimmedUserText.length > 0) {
-              openAiMessagesFromThisAnthropicMessage.push({ role: "user", content: trimmedUserText });
+              openAiMessagesFromThisAnthropicMessage.push({
+                role: "user",
+                content: trimmedUserText,
+              });
             }
-            openAiMessagesFromThisAnthropicMessage.push(...subsequentToolMessages);
+            openAiMessagesFromThisAnthropicMessage.push(
+              ...subsequentToolMessages
+            );
           } else {
-             let combinedContent = "";
+            let combinedContent = "";
             anthropicMessage.content.forEach((contentPart) => {
               if (contentPart.type === "text") {
-                combinedContent += (typeof contentPart.text === "string" ? contentPart.text : JSON.stringify(contentPart.text)) + "\n";
+                combinedContent +=
+                  (typeof contentPart.text === "string"
+                    ? contentPart.text
+                    : JSON.stringify(contentPart.text)) + "\n";
               } else {
                 combinedContent += JSON.stringify(contentPart) + "\n";
               }
             });
             const trimmedCombinedContent = combinedContent.trim();
             if (trimmedCombinedContent.length > 0) {
-              openAiMessagesFromThisAnthropicMessage.push({ role: anthropicMessage.role, content: trimmedCombinedContent });
+              openAiMessagesFromThisAnthropicMessage.push({
+                role: anthropicMessage.role,
+                content: trimmedCombinedContent,
+              });
             }
           }
           return openAiMessagesFromThisAnthropicMessage;
         })
       : [];
 
-    const systemText = Array.isArray(system) ? system.map(s => s.text).join('\n') : String(system);
+    const systemText = Array.isArray(system)
+      ? system.map((s) => s.text).join("\n")
+      : String(system);
 
     // Responses API 用にリクエストボディを再構築
     const newRequestBody = {
@@ -103,11 +130,14 @@ export const formatRequest = async (
       input: openAIMessages,
       tools: [{ type: "web_search_preview" }],
       stream: true,
-      temperature: temperature,
+      // temperature: temperature,
     };
 
     req.body = newRequestBody;
-    log("Formatted request for Responses API:", JSON.stringify(newRequestBody, null, 2));
+    log(
+      "Formatted request for Responses API:",
+      JSON.stringify(newRequestBody, null, 2)
+    );
 
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
@@ -116,7 +146,6 @@ export const formatRequest = async (
     }
 
     next();
-
   } catch (error) {
     console.error("Error in formatRequest:", error);
     res.status(500).json({ error: (error as Error).message });
