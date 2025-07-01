@@ -22,15 +22,35 @@ export async function streamOpenAIResponse(
 
   // ガード付き書き込み & 終了制御
   let ended = false;
+
   const write = (data: string) => {
-    if (ended) return;
-    log("response: ", data);
-    res.write(data);
+    // if (ended) return;
+    if (ended) {
+      log("[Debug] write skipped: already ended");
+      return;
+    }
+    try {
+      res.write(data);
+      const flusher =
+        (res as any).flush?.bind(res) || (res as any).flushHeaders?.bind(res);
+      if (typeof flusher === "function") flusher();
+    } catch (err) {
+      log("[Debug] res.write threw", err);
+
+      if (err.code === "ERR_STREAM_WRITE_AFTER_END" || err.code === "EPIPE") {
+        log("[Debug] ignored write-after-end/EPIPE");
+      } else {
+        log("[Debug] unexpected res.write error:", err);
+        throw err; // 本当に致命的なエラーだけ再スロー
+      }
+    }
   };
-  const safeEnd = () => {
+
+  const safeEnd = (reason = "unknown") => {
     if (ended) return;
+    log("[Debug] safeEnd called, reason =", reason);
     ended = true;
-    safeEnd();
+    res.end();
   };
 
   // const messageId = `msg_${Date.now()}`;
@@ -77,7 +97,16 @@ export async function streamOpenAIResponse(
   let contentBlockIndex = 0;
 
   let waitingToolResult = false; // ツールが返答を返してくるか
-  let allTextDone = false; // output_text が終わったか
+  let completed = false; // response.completed を受け取ったか
+  let textDone = false; // output_text.done を受け取ったか
+
+  // Node.js ストリームなら end/close も拾えるようにデバッグ用ハンドラをつける
+  if (typeof stream.on === "function") {
+    stream.on("readable", () => log("[Debug] stream 'readable' event fired"));
+    stream.on("end", () => log("[Debug] stream 'end' event fired"));
+    stream.on("close", () => log("[Debug] stream 'close' event fired"));
+    stream.on("error", (err: any) => log("[Debug] stream 'error' event:", err));
+  }
 
   try {
     // Send message_start event immediately
@@ -144,7 +173,7 @@ export async function streamOpenAIResponse(
 
         /* output_text が完全に終わった合図 */
         case "response.output_text.done": {
-          allTextDone = true;
+          textDone = true;
           if (hasTextBlockStarted) {
             write(
               `event: content_block_stop\ndata:${JSON.stringify({
@@ -264,32 +293,52 @@ export async function streamOpenAIResponse(
           break;
         }
 
+        case "response.done":
+        case "done":
         case "response.completed":
+          completed = true;
           if (hasTextBlockStarted) {
             // Stop the text block if it was started
-            const contentBlockStop = {
-              type: "content_block_stop",
-              index: 0,
-            };
-            write(
-              `event: content_block_stop\ndata: ${JSON.stringify(
-                contentBlockStop
-              )}\n\n`
+            // const contentBlockStop = {
+            //   type: "content_block_stop",
+            //   index: 0,
+            // };
+            // write(
+            //   `event: content_block_stop\ndata: ${JSON.stringify(
+            //     contentBlockStop
+            //   )}\n\n`
+            // );
+            /* ========= ループが自然終了した場合の後処理 =================== */
+            console.log(
+              "[Debug] for-await loop exhausted; completed =",
+              completed
             );
+
+            if (!ended) {
+              /* 終端イベントを検知できなかった場合でも、ここで強制的に閉じる */
+              if (!completed) {
+                log(
+                  "[Warn] stream closed without explicit completed event – " +
+                    "sending synthetic terminator"
+                );
+              }
+
+              write(
+                `event: message_delta\ndata:${JSON.stringify({
+                  type: "message_delta",
+                  delta: { stop_reason: "end_turn", stop_sequence: null },
+                  usage: { output_tokens: 1 },
+                })}\n\n`
+              );
+              write(
+                `event: message_stop\ndata:${JSON.stringify({
+                  type: "message_stop",
+                })}\n\n`
+              );
+              safeEnd("loop_exhausted");
+            }
           }
 
-          // Send message_delta with the final stop reason
-          const messageDelta = {
-            type: "message_delta",
-            delta: {
-              stop_reason: "end_turn", // Derived from 'completed' status
-              stop_sequence: null,
-            },
-            usage: { output_tokens: event.response?.usage?.output_tokens || 1 },
-          };
-          write(
-            `event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`
-          );
           break;
 
         case "response.error":
@@ -315,7 +364,13 @@ export async function streamOpenAIResponse(
       }
 
       /* フェイルセーフ: すべて終わったら自前で close */
-      if (allTextDone && !isToolUse && !waitingToolResult) {
+      if (
+        completed &&
+        !isToolUse &&
+        !waitingToolResult &&
+        // テキスト出力がなかった場合 or 正常に終わった場合 のどちらもOK
+        (!hasTextBlockStarted || textDone)
+      ) {
         write(
           `event: message_delta\ndata:${JSON.stringify({
             type: "message_delta",
@@ -332,6 +387,8 @@ export async function streamOpenAIResponse(
         return;
       }
     }
+
+    console.log("[Debug] for-await loop has exited normally");
   } catch (e: any) {
     // log("Error in stream processing:", e);
     // const errorJson = JSON.stringify({
@@ -339,6 +396,7 @@ export async function streamOpenAIResponse(
     //   error: { type: "internal_server_error", message: e.message },
     // });
     // write(`event: error\ndata: ${errorJson}\n\n`);
+    console.log("[Debug] Error in stream processing:", e);
     log("Error in stream processing:", e);
     const errEvent = {
       type: "error",
@@ -351,23 +409,10 @@ export async function streamOpenAIResponse(
       return;
     }
   } finally {
-    // Finally, send the message_stop event
-    // const messageStop = { type: "message_stop" };
-    // write(`event: message_stop\ndata: ${JSON.stringify(messageStop)}\n\n`);
-    // safeEnd();
-
-    // --- 残ったコンテンツブロックをクローズ ---
-    if (isToolUse || hasTextBlockStarted) {
-      write(
-        `event: content_block_stop\ndata: ${JSON.stringify({
-          type: "content_block_stop",
-          index: contentBlockIndex,
-        })}\n\n`
-      );
-    }
-    // 最終的な message_stop
-    const messageStop = { type: "message_stop" };
-    write(`event: message_stop\ndata: ${JSON.stringify(messageStop)}\n\n`);
-    safeEnd();
+    /* まだ閉じていない場合のみ後片付け */
+    console.log("[Debug] entering finally block; ended =", ended);
+    /* finally 節では “万が一” safeEnd が呼ばれていない場合だけ実行 */
+    console.log("[Debug] entering finally block; ended =", ended);
+    if (!ended) safeEnd("finally");
   }
 }
