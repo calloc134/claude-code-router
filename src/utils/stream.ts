@@ -1,343 +1,418 @@
 import { Response } from "express";
-import { OpenAI } from "openai";
 import { log } from "./log";
 
-interface ContentBlock {
+// A simplified interface for the events we care about
+interface HandledEvent {
   type: string;
-  id?: string;
-  name?: string;
-  input?: any;
-  text?: string;
-}
-
-interface MessageEvent {
-  type: string;
-  message?: {
-    id: string;
-    type: string;
-    role: string;
-    content: any[];
-    model: string;
-    stop_reason: string | null;
-    stop_sequence: string | null;
-    usage: {
-      input_tokens: number;
-      output_tokens: number;
-    };
-  };
-  delta?: {
-    stop_reason?: string;
-    stop_sequence?: string | null;
-    content?: ContentBlock[];
-    type?: string;
-    text?: string;
-    partial_json?: string;
-  };
-  index?: number;
-  content_block?: ContentBlock;
-  usage?: {
-    input_tokens: number;
-    output_tokens: number;
-  };
+  delta?: { text: string };
+  response?: { status: string };
+  error?: { message: string };
 }
 
 export async function streamOpenAIResponse(
   res: Response,
-  completion: any,
+  stream: any, // The stream from openai.responses.create
   model: string,
   body: any
 ) {
+  // const write = (data: string) => {
+  //   log("response: ", data);
+  //   res.write(data);
+  // };
+
+  // ガード付き書き込み & 終了制御
+  let ended = false;
+
   const write = (data: string) => {
-    log("response: ", data);
-    res.write(data);
-  };
-  const messageId = "msg_" + Date.now();
-  if (!body.stream) {
-    let content: any = [];
-    if (completion.choices[0].message.content) {
-      content = [ { text: completion.choices[0].message.content, type: "text" } ];
-    }
-    else if (completion.choices[0].message.tool_calls) {
-      content = completion.choices[0].message.tool_calls.map((item: any) => {
-        return {
-          type: 'tool_use',
-          id: item.id,
-          name: item.function?.name,
-          input: item.function?.arguments ? JSON.parse(item.function.arguments) : {},
-        };
-      });
-    }
-
-    const result = {
-      id: messageId,
-      type: "message",
-      role: "assistant",
-      // @ts-ignore
-      content: content,
-      stop_reason: completion.choices[0].finish_reason === 'tool_calls' ? "tool_use" : "end_turn",
-      stop_sequence: null,
-    };
-    try {
-      res.json(result);
-      res.end();
+    // if (ended) return;
+    if (ended) {
+      log("[Debug] write skipped: already ended");
       return;
-    } catch (error) {
-      log("Error sending response:", error);
-      res.status(500).send("Internal Server Error");
     }
-  }
+    try {
+      res.write(data);
+      const flusher =
+        (res as any).flush?.bind(res) || (res as any).flushHeaders?.bind(res);
+      if (typeof flusher === "function") flusher();
+    } catch (err) {
+      log("[Debug] res.write threw", err);
 
-  let contentBlockIndex = 0;
-  let currentContentBlocks: ContentBlock[] = [];
-
-  // Send message_start event
-  const messageStart: MessageEvent = {
-    type: "message_start",
-    message: {
-      id: messageId,
-      type: "message",
-      role: "assistant",
-      content: [],
-      model,
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 1, output_tokens: 1 },
-    },
-  };
-  write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`);
-
-  let isToolUse = false;
-  let toolUseJson = "";
-  let hasStartedTextBlock = false;
-  let currentToolCallId: string | null = null;
-  let toolCallJsonMap = new Map<string, string>();
-
-  try {
-    for await (const chunk of completion) {
-      log("Processing chunk:", chunk);
-      const delta = chunk.choices[0].delta;
-
-      if (delta.tool_calls && delta.tool_calls.length > 0) {
-        for (const toolCall of delta.tool_calls) {
-          const toolCallId = toolCall.id;
-          
-          // Check if this is a new tool call by ID
-          if (toolCallId && toolCallId !== currentToolCallId) {
-            // End previous tool call if one was active
-            if (isToolUse && currentToolCallId) {
-              const contentBlockStop: MessageEvent = {
-                type: "content_block_stop",
-                index: contentBlockIndex,
-              };
-              write(
-                `event: content_block_stop\ndata: ${JSON.stringify(
-                  contentBlockStop
-                )}\n\n`
-              );
-            }
-
-            // Start new tool call block
-            isToolUse = true;
-            currentToolCallId = toolCallId;
-            contentBlockIndex++;
-            toolCallJsonMap.set(toolCallId, ""); // Initialize JSON accumulator for this tool call
-
-            const toolBlock: ContentBlock = {
-              type: "tool_use",
-              id: toolCallId,
-              name: toolCall.function?.name,
-              input: {},
-            };
-
-            const toolBlockStart: MessageEvent = {
-              type: "content_block_start",
-              index: contentBlockIndex,
-              content_block: toolBlock,
-            };
-
-            currentContentBlocks.push(toolBlock);
-
-            write(
-              `event: content_block_start\ndata: ${JSON.stringify(
-                toolBlockStart
-              )}\n\n`
-            );
-          }
-
-          // Stream tool call JSON
-          if (toolCall.function?.arguments && currentToolCallId) {
-            const jsonDelta: MessageEvent = {
-              type: "content_block_delta",
-              index: contentBlockIndex,
-              delta: {
-                type: "input_json_delta",
-                partial_json: toolCall.function.arguments,
-              },
-            };
-
-            // Accumulate JSON for this specific tool call
-            const currentJson = toolCallJsonMap.get(currentToolCallId) || "";
-            toolCallJsonMap.set(currentToolCallId, currentJson + toolCall.function.arguments);
-            toolUseJson = toolCallJsonMap.get(currentToolCallId) || "";
-
-            try {
-              const parsedJson = JSON.parse(toolUseJson);
-              currentContentBlocks[contentBlockIndex].input = parsedJson;
-            } catch (e) {
-              log("JSON parsing error (continuing to accumulate):", e);
-              // JSON not yet complete, continue accumulating
-            }
-
-            write(
-              `event: content_block_delta\ndata: ${JSON.stringify(jsonDelta)}\n\n`
-            );
-          }
-        }
-      } else if (delta.content) {
-        // Handle regular text content
-        if (isToolUse) {
-          log("Tool call ended here:", delta);
-          // End previous tool call block
-          const contentBlockStop: MessageEvent = {
-            type: "content_block_stop",
-            index: contentBlockIndex,
-          };
-
-          write(
-            `event: content_block_stop\ndata: ${JSON.stringify(
-              contentBlockStop
-            )}\n\n`
-          );
-          contentBlockIndex++;
-          isToolUse = false;
-          currentToolCallId = null;
-          toolUseJson = ""; // Reset for safety
-        }
-
-        if (!delta.content) continue;
-
-        // If text block not yet started, send content_block_start
-        if (!hasStartedTextBlock) {
-          const textBlock: ContentBlock = {
-            type: "text",
-            text: "",
-          };
-
-          const textBlockStart: MessageEvent = {
-            type: "content_block_start",
-            index: contentBlockIndex,
-            content_block: textBlock,
-          };
-
-          currentContentBlocks.push(textBlock);
-
-          write(
-            `event: content_block_start\ndata: ${JSON.stringify(
-              textBlockStart
-            )}\n\n`
-          );
-          hasStartedTextBlock = true;
-        }
-
-        // Send regular text content
-        const contentDelta: MessageEvent = {
-          type: "content_block_delta",
-          index: contentBlockIndex,
-          delta: {
-            type: "text_delta",
-            text: delta.content,
-          },
-        };
-
-        // Update content block text
-        if (currentContentBlocks[contentBlockIndex]) {
-          currentContentBlocks[contentBlockIndex].text += delta.content;
-        }
-
-        write(
-          `event: content_block_delta\ndata: ${JSON.stringify(
-            contentDelta
-          )}\n\n`
-        );
+      if (err.code === "ERR_STREAM_WRITE_AFTER_END" || err.code === "EPIPE") {
+        log("[Debug] ignored write-after-end/EPIPE");
+      } else {
+        log("[Debug] unexpected res.write error:", err);
+        throw err; // 本当に致命的なエラーだけ再スロー
       }
     }
-  } catch (e: any) {
-    // If text block not yet started, send content_block_start
-    if (!hasStartedTextBlock) {
-      const textBlock: ContentBlock = {
-        type: "text",
-        text: "",
-      };
+  };
 
-      const textBlockStart: MessageEvent = {
-        type: "content_block_start",
-        index: contentBlockIndex,
-        content_block: textBlock,
-      };
+  const safeEnd = (reason = "unknown") => {
+    if (ended) return;
+    log("[Debug] safeEnd called, reason =", reason);
+    ended = true;
+    res.end();
+  };
 
-      currentContentBlocks.push(textBlock);
+  // const messageId = `msg_${Date.now()}`;
+  // const contentBlockId = `content-block-${Date.now()}`;
+  // let hasTextBlockStarted = false;
 
-      write(
-        `event: content_block_start\ndata: ${JSON.stringify(
-          textBlockStart
-        )}\n\n`
-      );
-      hasStartedTextBlock = true;
+  // const messageId = `msg_${Date.now()}`;
+  if (!body.stream && typeof stream[Symbol.asyncIterator] !== "function") {
+    const completion = stream as any;
+    let content: any[] = [];
+    if (completion.choices?.[0]?.message?.content) {
+      content = [{ text: completion.choices[0].message.content, type: "text" }];
+    } else if (completion.choices?.[0]?.message?.tool_calls) {
+      content = completion.choices[0].message.tool_calls.map((tc: any) => ({
+        type: "tool_use",
+        id: tc.id,
+        name: tc.function?.name,
+        input: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {},
+      }));
     }
+    // 従来フォーマットで即時返却
+    res.json({
+      id: `msg_${Date.now()}`,
+      type: "message",
+      role: "assistant",
+      content,
+      stop_reason:
+        completion.choices[0].finish_reason === "tool_calls"
+          ? "tool_use"
+          : "end_turn",
+      stop_sequence: null,
+    });
+    safeEnd();
+    return;
+  }
 
-    // Send regular text content
-    const contentDelta: MessageEvent = {
-      type: "content_block_delta",
-      index: contentBlockIndex,
-      delta: {
-        type: "text_delta",
-        text: JSON.stringify(e),
+  const messageId = `msg_${Date.now()}`;
+  const contentBlockId = `content-block-${Date.now()}`;
+  let hasTextBlockStarted = false;
+  // --- ツール呼び出し用ステートを追加 ---
+  let isToolUse = false;
+  let toolCallJson = "";
+  let currentToolCallId: string | null = null;
+  let contentBlockIndex = 0;
+
+  let waitingToolResult = false; // ツールが返答を返してくるか
+  let completed = false; // response.completed を受け取ったか
+  let textDone = false; // output_text.done を受け取ったか
+
+  // Node.js ストリームなら end/close も拾えるようにデバッグ用ハンドラをつける
+  if (typeof stream.on === "function") {
+    stream.on("readable", () => log("[Debug] stream 'readable' event fired"));
+    stream.on("end", () => log("[Debug] stream 'end' event fired"));
+    stream.on("close", () => log("[Debug] stream 'close' event fired"));
+    stream.on("error", (err: any) => log("[Debug] stream 'error' event:", err));
+  }
+
+  try {
+    // Send message_start event immediately
+    const messageStart = {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        content: [],
+        model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 }, // Dummy usage
       },
     };
+    write(`event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`);
 
-    // Update content block text
-    if (currentContentBlocks[contentBlockIndex]) {
-      currentContentBlocks[contentBlockIndex].text += JSON.stringify(e);
+    for await (const event of stream) {
+      log("event received", JSON.stringify(event, null, 2));
+
+      switch (event.type) {
+        case "response.output_text.delta":
+          if (!hasTextBlockStarted) {
+            // If this is the first text delta, send content_block_start
+            const contentBlockStart = {
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "text", id: contentBlockId, text: "" },
+            };
+            write(
+              `event: content_block_start\ndata: ${JSON.stringify(
+                contentBlockStart
+              )}\n\n`
+            );
+            hasTextBlockStarted = true;
+          }
+          // Send the actual text chunk
+          // const contentDelta = {
+          //   type: "content_block_delta",
+          //   index: 0,
+          //   delta: { type: "text_delta", text: event.delta },
+          // };
+          console.log("event", event);
+          // const chunkText = event.delta?.text ?? "";
+          const chunkText =
+            typeof event.delta === "string"
+              ? event.delta
+              : event.delta?.text ?? "";
+          const contentDelta = {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: chunkText },
+          };
+          write(
+            // `event: content_block_delta\ndata: ${JSON.stringify(
+            //   contentDelta
+            // )}\n\n`
+            `event: content_block_delta\ndata: ${JSON.stringify(
+              contentDelta
+            )}\n\n`
+          );
+          break;
+
+        /* output_text が完全に終わった合図 */
+        case "response.output_text.done": {
+          textDone = true;
+          if (hasTextBlockStarted) {
+            write(
+              `event: content_block_stop\ndata:${JSON.stringify({
+                type: "content_block_stop",
+                index: 0,
+              })}\n\n`
+            );
+            hasTextBlockStarted = false;
+          }
+          break;
+        }
+        // --- ツール呼び出しイベントのハンドリングを追加 ---
+        case "response.tool_call.started":
+        case "response.tool_call.in_progress":
+          // ツール呼び出し開始を検知
+          if (!isToolUse && event.tool_call?.id) {
+            isToolUse = true;
+            currentToolCallId = event.tool_call.id;
+            toolCallJson = "";
+            // SSE: content_block_start（ツールブロック）
+            contentBlockIndex++;
+            write(
+              `event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: contentBlockIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: currentToolCallId,
+                  name: event.tool_call.name,
+                  input: {},
+                },
+              })}\n\n`
+            );
+          }
+          // 引き続き JSON 部分を蓄積
+          if (isToolUse && event.tool_call?.arguments) {
+            // toolCallJson += event.tool_call.arguments;
+            // v5 SDK は arguments.delta または arguments.partial_json を吐く
+            const argChunk =
+              typeof event.tool_call.arguments === "string"
+                ? event.tool_call.arguments
+                : event.tool_call.arguments?.partial_json ?? "";
+            toolCallJson += argChunk;
+
+            // 配信
+            write(
+              `event: content_block_delta\ndata:${JSON.stringify({
+                type: "content_block_delta",
+                index: contentBlockIndex,
+                delta: {
+                  type: "input_json_delta",
+                  partial_json: argChunk,
+                },
+              })}\n\n`
+            );
+          }
+          break;
+
+        case "response.tool_call.completed":
+          if (isToolUse) {
+            // JSON をパースして SSE で送信
+            try {
+              JSON.parse(toolCallJson);
+            } catch {}
+            write(
+              `event: content_block_delta\ndata: ${JSON.stringify({
+                type: "content_block_delta",
+                index: contentBlockIndex,
+                delta: { type: "input_json_delta", partial_json: toolCallJson },
+              })}\n\n`
+            );
+            // ツールブロック終了
+            write(
+              `event: content_block_stop\ndata: ${JSON.stringify({
+                type: "content_block_stop",
+                index: contentBlockIndex,
+              })}\n\n`
+            );
+            isToolUse = false;
+            toolCallJson = "";
+            currentToolCallId = null;
+          }
+          waitingToolResult = true; // ツール側の result を待つ
+          break;
+
+        /* ---------- ツール結果 ---------- */
+        case "response.tool_result.started": {
+          /* ここではブロック開始はせず delta でまとめ送信する */
+          break;
+        }
+
+        case "response.tool_result.delta": {
+          // Claude-Code 互換: tool_result は text として流す
+          const toolText =
+            typeof event.delta === "string"
+              ? event.delta
+              : event.delta?.text ?? "";
+          write(
+            `event: content_block_delta\ndata:${JSON.stringify({
+              type: "content_block_delta",
+              index: contentBlockIndex + 1, // result 用に 1 つ先を使う
+              delta: { type: "text_delta", text: toolText },
+            })}\n\n`
+          );
+          break;
+        }
+
+        case "response.tool_result.completed": {
+          // 結果用コンテンツブロックを閉じる
+          write(
+            `event: content_block_stop\ndata:${JSON.stringify({
+              type: "content_block_stop",
+              index: contentBlockIndex + 1,
+            })}\n\n`
+          );
+          waitingToolResult = false;
+          break;
+        }
+
+        case "response.done":
+        case "done":
+        case "response.completed":
+          completed = true;
+          if (hasTextBlockStarted) {
+            // Stop the text block if it was started
+            // const contentBlockStop = {
+            //   type: "content_block_stop",
+            //   index: 0,
+            // };
+            // write(
+            //   `event: content_block_stop\ndata: ${JSON.stringify(
+            //     contentBlockStop
+            //   )}\n\n`
+            // );
+            /* ========= ループが自然終了した場合の後処理 =================== */
+            console.log(
+              "[Debug] for-await loop exhausted; completed =",
+              completed
+            );
+
+            if (!ended) {
+              /* 終端イベントを検知できなかった場合でも、ここで強制的に閉じる */
+              if (!completed) {
+                log(
+                  "[Warn] stream closed without explicit completed event – " +
+                    "sending synthetic terminator"
+                );
+              }
+
+              write(
+                `event: message_delta\ndata:${JSON.stringify({
+                  type: "message_delta",
+                  delta: { stop_reason: "end_turn", stop_sequence: null },
+                  usage: { output_tokens: 1 },
+                })}\n\n`
+              );
+              write(
+                `event: message_stop\ndata:${JSON.stringify({
+                  type: "message_stop",
+                })}\n\n`
+              );
+              safeEnd("loop_exhausted");
+            }
+          }
+
+          break;
+
+        case "response.error":
+          log("Stream error:", event.error);
+          const errorJson = JSON.stringify({
+            type: "error",
+            error: {
+              type: "api_error",
+              message: event.error?.message || "Unknown error",
+            },
+          });
+          write(`event: error\ndata: ${errorJson}\n\n`);
+          break;
+
+        // Other events are logged but ignored for the client-side stream
+        case "response.created":
+        case "response.in_progress":
+        case "response.web_search_call.in_progress":
+        case "response.web_search_call.searching":
+        case "response.web_search_call.completed":
+          // case "response.output_text.done":
+          break;
+      }
+
+      /* フェイルセーフ: すべて終わったら自前で close */
+      if (
+        completed &&
+        !isToolUse &&
+        !waitingToolResult &&
+        // テキスト出力がなかった場合 or 正常に終わった場合 のどちらもOK
+        (!hasTextBlockStarted || textDone)
+      ) {
+        write(
+          `event: message_delta\ndata:${JSON.stringify({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: 1 },
+          })}\n\n`
+        );
+        write(
+          `event: message_stop\ndata:${JSON.stringify({
+            type: "message_stop",
+          })}\n\n`
+        );
+        safeEnd();
+        return;
+      }
     }
 
-    write(
-      `event: content_block_delta\ndata: ${JSON.stringify(contentDelta)}\n\n`
-    );
-  }
-
-  // Close last content block if any is open
-  if (isToolUse || hasStartedTextBlock) {
-    const contentBlockStop: MessageEvent = {
-      type: "content_block_stop",
-      index: contentBlockIndex,
+    console.log("[Debug] for-await loop has exited normally");
+  } catch (e: any) {
+    // log("Error in stream processing:", e);
+    // const errorJson = JSON.stringify({
+    //   type: "error",
+    //   error: { type: "internal_server_error", message: e.message },
+    // });
+    // write(`event: error\ndata: ${errorJson}\n\n`);
+    console.log("[Debug] Error in stream processing:", e);
+    log("Error in stream processing:", e);
+    const errEvent = {
+      type: "error",
+      error: { type: "stream_error", message: e.message },
     };
-
-    write(
-      `event: content_block_stop\ndata: ${JSON.stringify(contentBlockStop)}\n\n`
-    );
+    write(`event: error\ndata: ${JSON.stringify(errEvent)}\n\n`);
+    // 非ストリーミング呼び出し時は HTTP 500 も返却
+    if (!body.stream) {
+      res.status(500).json({ error: e.message });
+      return;
+    }
+  } finally {
+    /* まだ閉じていない場合のみ後片付け */
+    console.log("[Debug] entering finally block; ended =", ended);
+    /* finally 節では “万が一” safeEnd が呼ばれていない場合だけ実行 */
+    console.log("[Debug] entering finally block; ended =", ended);
+    if (!ended) safeEnd("finally");
   }
-
-  // Send message_delta event with appropriate stop_reason
-  const messageDelta: MessageEvent = {
-    type: "message_delta",
-    delta: {
-      stop_reason: isToolUse ? "tool_use" : "end_turn",
-      stop_sequence: null,
-      content: currentContentBlocks,
-    },
-    usage: { input_tokens: 100, output_tokens: 150 },
-  };
-  if (!isToolUse) {
-    log("body: ", body, "messageDelta: ", messageDelta);
-  }
-
-  write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`);
-
-  // Send message_stop event
-  const messageStop: MessageEvent = {
-    type: "message_stop",
-  };
-
-  write(`event: message_stop\ndata: ${JSON.stringify(messageStop)}\n\n`);
-  res.end();
 }
