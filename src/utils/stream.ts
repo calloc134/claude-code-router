@@ -15,9 +15,22 @@ export async function streamOpenAIResponse(
   model: string,
   body: any
 ) {
+  // const write = (data: string) => {
+  //   log("response: ", data);
+  //   res.write(data);
+  // };
+
+  // ガード付き書き込み & 終了制御
+  let ended = false;
   const write = (data: string) => {
+    if (ended) return;
     log("response: ", data);
     res.write(data);
+  };
+  const safeEnd = () => {
+    if (ended) return;
+    ended = true;
+    safeEnd();
   };
 
   // const messageId = `msg_${Date.now()}`;
@@ -50,7 +63,7 @@ export async function streamOpenAIResponse(
           : "end_turn",
       stop_sequence: null,
     });
-    res.end();
+    safeEnd();
     return;
   }
 
@@ -62,6 +75,9 @@ export async function streamOpenAIResponse(
   let toolCallJson = "";
   let currentToolCallId: string | null = null;
   let contentBlockIndex = 0;
+
+  let waitingToolResult = false; // ツールが返答を返してくるか
+  let allTextDone = false; // output_text が終わったか
 
   try {
     // Send message_start event immediately
@@ -100,18 +116,46 @@ export async function streamOpenAIResponse(
             hasTextBlockStarted = true;
           }
           // Send the actual text chunk
+          // const contentDelta = {
+          //   type: "content_block_delta",
+          //   index: 0,
+          //   delta: { type: "text_delta", text: event.delta },
+          // };
+          console.log("event", event);
+          // const chunkText = event.delta?.text ?? "";
+          const chunkText =
+            typeof event.delta === "string"
+              ? event.delta
+              : event.delta?.text ?? "";
           const contentDelta = {
             type: "content_block_delta",
             index: 0,
-            delta: { type: "text_delta", text: event.delta },
+            delta: { type: "text_delta", text: chunkText },
           };
           write(
+            // `event: content_block_delta\ndata: ${JSON.stringify(
+            //   contentDelta
+            // )}\n\n`
             `event: content_block_delta\ndata: ${JSON.stringify(
               contentDelta
             )}\n\n`
           );
           break;
 
+        /* output_text が完全に終わった合図 */
+        case "response.output_text.done": {
+          allTextDone = true;
+          if (hasTextBlockStarted) {
+            write(
+              `event: content_block_stop\ndata:${JSON.stringify({
+                type: "content_block_stop",
+                index: 0,
+              })}\n\n`
+            );
+            hasTextBlockStarted = false;
+          }
+          break;
+        }
         // --- ツール呼び出しイベントのハンドリングを追加 ---
         case "response.tool_call.started":
         case "response.tool_call.in_progress":
@@ -137,7 +181,25 @@ export async function streamOpenAIResponse(
           }
           // 引き続き JSON 部分を蓄積
           if (isToolUse && event.tool_call?.arguments) {
-            toolCallJson += event.tool_call.arguments;
+            // toolCallJson += event.tool_call.arguments;
+            // v5 SDK は arguments.delta または arguments.partial_json を吐く
+            const argChunk =
+              typeof event.tool_call.arguments === "string"
+                ? event.tool_call.arguments
+                : event.tool_call.arguments?.partial_json ?? "";
+            toolCallJson += argChunk;
+
+            // 配信
+            write(
+              `event: content_block_delta\ndata:${JSON.stringify({
+                type: "content_block_delta",
+                index: contentBlockIndex,
+                delta: {
+                  type: "input_json_delta",
+                  partial_json: argChunk,
+                },
+              })}\n\n`
+            );
           }
           break;
 
@@ -165,7 +227,42 @@ export async function streamOpenAIResponse(
             toolCallJson = "";
             currentToolCallId = null;
           }
+          waitingToolResult = true; // ツール側の result を待つ
           break;
+
+        /* ---------- ツール結果 ---------- */
+        case "response.tool_result.started": {
+          /* ここではブロック開始はせず delta でまとめ送信する */
+          break;
+        }
+
+        case "response.tool_result.delta": {
+          // Claude-Code 互換: tool_result は text として流す
+          const toolText =
+            typeof event.delta === "string"
+              ? event.delta
+              : event.delta?.text ?? "";
+          write(
+            `event: content_block_delta\ndata:${JSON.stringify({
+              type: "content_block_delta",
+              index: contentBlockIndex + 1, // result 用に 1 つ先を使う
+              delta: { type: "text_delta", text: toolText },
+            })}\n\n`
+          );
+          break;
+        }
+
+        case "response.tool_result.completed": {
+          // 結果用コンテンツブロックを閉じる
+          write(
+            `event: content_block_stop\ndata:${JSON.stringify({
+              type: "content_block_stop",
+              index: contentBlockIndex + 1,
+            })}\n\n`
+          );
+          waitingToolResult = false;
+          break;
+        }
 
         case "response.completed":
           if (hasTextBlockStarted) {
@@ -213,8 +310,26 @@ export async function streamOpenAIResponse(
         case "response.web_search_call.in_progress":
         case "response.web_search_call.searching":
         case "response.web_search_call.completed":
-        case "response.output_text.done":
+          // case "response.output_text.done":
           break;
+      }
+
+      /* フェイルセーフ: すべて終わったら自前で close */
+      if (allTextDone && !isToolUse && !waitingToolResult) {
+        write(
+          `event: message_delta\ndata:${JSON.stringify({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: 1 },
+          })}\n\n`
+        );
+        write(
+          `event: message_stop\ndata:${JSON.stringify({
+            type: "message_stop",
+          })}\n\n`
+        );
+        safeEnd();
+        return;
       }
     }
   } catch (e: any) {
@@ -239,7 +354,7 @@ export async function streamOpenAIResponse(
     // Finally, send the message_stop event
     // const messageStop = { type: "message_stop" };
     // write(`event: message_stop\ndata: ${JSON.stringify(messageStop)}\n\n`);
-    // res.end();
+    // safeEnd();
 
     // --- 残ったコンテンツブロックをクローズ ---
     if (isToolUse || hasTextBlockStarted) {
@@ -253,6 +368,6 @@ export async function streamOpenAIResponse(
     // 最終的な message_stop
     const messageStop = { type: "message_stop" };
     write(`event: message_stop\ndata: ${JSON.stringify(messageStop)}\n\n`);
-    res.end();
+    safeEnd();
   }
 }
