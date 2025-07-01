@@ -10,9 +10,11 @@ export const formatRequest = async (
 ) => {
   let {
     model,
+    max_tokens,
     messages,
     system = [],
-    temperature,
+    // temperature,
+    metadata,
     tools,
     stream,
   }: MessageCreateParamsBase = req.body;
@@ -119,18 +121,39 @@ export const formatRequest = async (
         })
       : [];
 
-    const systemText = Array.isArray(system)
-      ? system.map((s) => s.text).join("\n")
-      : String(system);
+    // const systemText = Array.isArray(system)
+    //   ? system.map((s) => s.text).join("\n")
+    //   : String(system);
+
+    const instructions = Array.isArray(system)
+      ? system.map((s) => ({ role: "system", content: s.text }))
+      : [{ role: "system", content: String(system) }];
+
+    const responseTools = [
+      // ...tools
+      //   .filter((t) => !["StickerRequest"].includes(t.name))
+      //   .map((t) => ({
+      //     type: "function",
+      //     function: {
+      //       name: t.name,
+      //       description: t.description,
+      //       parameters: t.input_schema,
+      //     },
+      //   })),
+      // 例外なく入れる web_search_preview
+      { type: "web_search_preview" },
+    ];
 
     // Responses API 用にリクエストボディを再構築
     const newRequestBody = {
       model: model || process.env.OPENAI_MODEL,
-      instructions: systemText,
+      instructions,
       input: openAIMessages,
-      tools: [{ type: "web_search_preview" }],
-      stream: true,
+      tools: responseTools,
+      stream: stream || false,
       // temperature: temperature,
+      metadata,
+      max_tokens,
     };
 
     req.body = newRequestBody;
