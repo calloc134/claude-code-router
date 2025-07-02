@@ -149,30 +149,25 @@ export const formatRequest = async (
           return openAiMessagesFromThisAnthropicMessage;
         })
       : [];
-    const systemMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
-      Array.isArray(system)
-        ? system.map((item) => ({
-            role: "system",
-            content: item.text,
-          }))
-        : [{ role: "system", content: system }];
+    // system → instructions へ
+    const instructions = Array.isArray(system)
+      ? system.map((s) => s.text).join("\n")
+      : system;
+    // Responses API 用ペイロード
     const data: any = {
       model,
-      messages: [...systemMessages, ...openAIMessages],
-      temperature,
+      instructions,
+      input: openAIMessages,
       stream,
+      metadata,
     };
     if (tools) {
-      data.tools = tools
-        .filter((tool) => !["StickerRequest"].includes(tool.name))
-        .map((item: any) => ({
-          type: "function",
-          function: {
-            name: item.name,
-            description: item.description,
-            parameters: item.input_schema,
-          },
-        }));
+      data.tools = tools.map((item: any) => ({
+        type: "function",
+        name: item.name,
+        description: item.description,
+        parameters: item.input_schema,
+      }));
     }
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
