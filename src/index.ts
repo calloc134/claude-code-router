@@ -149,14 +149,8 @@ async function run(options: RunOptions = {}) {
   server.app.post("/v1/messages", async (req, res) => {
     try {
       const provider = getProviderInstance(req.provider || "default");
-      const stream = await provider.responses.create(req.body);
-      await streamOpenAIResponse(
-        res,
-        stream,
-        provider,
-        req.body.model,
-        req.body
-      );
+      const stream = provider.responses.create(req.body);
+      await streamOpenAIResponse(res, stream, req.body.model, req.body);
     } catch (e) {
       log("Error in OpenAI API call:", e);
     }

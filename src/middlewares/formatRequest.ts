@@ -162,12 +162,20 @@ export const formatRequest = async (
       metadata,
     };
     if (tools) {
-      data.tools = tools.map((item: any) => ({
+      // data.tools = tools.map((item: any) => ({
+      const oldTools = tools.map((item: any) => ({
         type: "function",
         name: item.name,
         description: item.description,
         parameters: item.input_schema,
       }));
+
+      data.tools = [
+        ...oldTools,
+        {
+          type: "web_search_preview",
+        },
+      ];
     }
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
